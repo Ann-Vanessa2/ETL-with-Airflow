@@ -2,6 +2,7 @@ from airflow import DAG
 from airflow.providers.postgres.operators.postgres import PostgresOperator
 from airflow.operators.python import PythonOperator
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+from airflow.providers.postgres.hooks.postgres import PostgresHook
 from datetime import datetime, timedelta
 import pandas as pd
 from io import StringIO
@@ -130,9 +131,13 @@ def transform_data():
         logging.info("Reading raw data directly from S3...")
 
         # Read CSVs directly from S3 into Pandas DataFrame
-        df_tracks = pd.read_csv(StringIO(s3_hook.read_key(raw_files["songs.csv"], S3_BUCKET)))
-        df_users = pd.read_csv(StringIO(s3_hook.read_key(raw_files["users.csv"], S3_BUCKET)))
-        df_streams = pd.read_csv(StringIO(s3_hook.read_key(raw_files["streams.csv"], S3_BUCKET)))
+        try:
+            df_tracks = pd.read_csv(StringIO(s3_hook.read_key(raw_files["songs.csv"], S3_BUCKET)))
+            df_users = pd.read_csv(StringIO(s3_hook.read_key(raw_files["users.csv"], S3_BUCKET)))
+            df_streams = pd.read_csv(StringIO(s3_hook.read_key(raw_files["streams.csv"], S3_BUCKET)))
+        except Exception as e:
+            logging.error(f"Error reading data from S3: {e}")
+            raise
 
         logging.info("Transforming data...")
         df_tracks.drop_duplicates(inplace=True)
@@ -150,7 +155,7 @@ def transform_data():
 
         # Check for missing values in the 'hour' column
         if df_streams['hour'].isnull().sum() > 0:
-            raise ValueError("❌ Some rows have missing 'hour' values. Check listen_time column!")
+            raise ValueError("Some rows have missing 'hour' values. Check listen_time column!")
 
         # Merging the datasets
         df_merged = df_streams.merge(df_tracks, on='track_id', how='left')
@@ -162,30 +167,91 @@ def transform_data():
             'avg_track_duration': df_merged.groupby(['date', 'track_genre'])['duration_ms'].mean(),
             'popularity_index': df_merged.groupby(['date', 'track_genre'])['popularity'].mean(),
             'most_popular_track': df_merged.loc[df_merged.groupby(['date', 'track_genre'])['listen_time'].idxmax()][['date', 'track_genre', 'track_id']],
+            # 'unique_listeners': df_merged.groupby(['date', 'hour'])['user_id'].nunique(),
+            # 'top_artists_per_day': df_merged.groupby(['date', 'hour'])['artists'].apply(lambda x: x.value_counts().idxmax()),
+            # 'track_diversity_index': df_merged.groupby(['date', 'hour']).apply(lambda x: x['track_id'].nunique() / len(x) if len(x) > 0 else 0)
+        }
+
+        kpis['most_popular_track'] = kpis['most_popular_track'].set_index(['date', 'track_genre'])
+
+        # KPIs with ['date', 'hour'] index - convert to ['date']
+        hourly_kpis = {
             'unique_listeners': df_merged.groupby(['date', 'hour'])['user_id'].nunique(),
             'top_artists_per_day': df_merged.groupby(['date', 'hour'])['artists'].apply(lambda x: x.value_counts().idxmax()),
             'track_diversity_index': df_merged.groupby(['date', 'hour']).apply(lambda x: x['track_id'].nunique() / len(x) if len(x) > 0 else 0)
         }
 
-        kpi_df = pd.DataFrame(kpis)
+        # Reset index so all KPIs have 'date' as a primary index
+        for key in hourly_kpis:
+            hourly_kpis[key] = hourly_kpis[key].reset_index().set_index('date')
+
+        # for df_name, df in {**kpis, **hourly_kpis}.items():
+        #     print(f"{df_name} non-numeric columns:", df.select_dtypes(exclude=['number']).columns.tolist())
+
+        # Convert Series to DataFrame and reset index
+        for key, df in {**kpis, **hourly_kpis}.items():
+            if isinstance(df, pd.Series):
+                df = df.to_frame(name=key)  # Convert Series to DataFrame
+            df.reset_index(inplace=True)
+            kpis[key] = df  # Store back after conversion
+
+        # Concatenate DataFrames properly
+        kpi_df = pd.concat(kpis.values(), axis=1).drop_duplicates()
+
+        # # Convert only numeric columns to float, ignore string columns
+        # for _, df in {**kpis, **hourly_kpis}.items():
+        #     if isinstance(df, pd.DataFrame):
+        #         for col in df.select_dtypes(include=['number']).columns:
+        #             df[col] = df[col].astype(float)  # Convert only numeric columns
+        #     elif isinstance(df, pd.Series):  # If it's a Series, convert it directly
+        #         df = df.astype(float)
+
+        # Convert all numeric columns to float64 to prevent dtype issues
+        for col in kpi_df.select_dtypes(include=['number']).columns:
+            kpi_df[col] = kpi_df[col].astype('float64')
+
+
+        # kpi_df = pd.DataFrame(kpis)
+        # kpi_df = pd.concat(list(kpis.values()) + list(hourly_kpis.values()), axis=1)
+
+        # # Reset index so all KPIs have 'date' as a primary index
+        # kpi_df.reset_index(inplace=True)
 
         # Save KPI DataFrame to S3
         csv_buffer = StringIO()
         kpi_df.to_csv(csv_buffer, index=True)
         s3_hook.load_string(csv_buffer.getvalue(), key=kpi_key, bucket_name=S3_BUCKET, replace=True)
 
-        logging.info(f"✅ KPI computation complete. Results saved to S3 at {kpi_key}")
+        logging.info(f"KPI computation complete. Results saved to S3 at {kpi_key}")
 
     except Exception as e:
         logging.error(f"Error in data transformation: {e}")
         raise
 
-# Airflow Task
 transform_task = PythonOperator(
     task_id='transform_data',
     python_callable=transform_data,
     dag=dag,
 )
+
+
+# def load_to_redshift():
+#     redshift_hook = PostgresHook(postgres_conn_id='redshift_default')
+#     sql_query = """
+#     COPY streaming_kpis
+#     FROM 's3://your-bucket-name/processed-data/kpis.csv'
+#     IAM_ROLE 'arn:aws:iam::your-account-id:role/YourRedshiftRole'
+#     CSV
+#     IGNOREHEADER 1;
+#     """
+#     redshift_hook.run(sql_query)
+#     logging.info("✅ Data successfully loaded into Redshift!")
+
+# load_data_task = PythonOperator(
+#     task_id="load_to_redshift",
+#     python_callable=load_to_redshift,
+#     dag=dag,
+# )
 
 
 extract_rds_task >> upload_s3_task >> transform_task
