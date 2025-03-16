@@ -1,0 +1,7 @@
+apache-airflow
+apache-airflow-providers-amazon
+apache-airflow-providers-postgres
+pandas
+psycopg2-binary
+python-dotenv
+boto3
