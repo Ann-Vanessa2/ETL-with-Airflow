@@ -47,3 +47,6 @@ This document provides a comprehensive guide on the implementation of an ETL pip
 
 - The ETL pipeline has been fully implemented, including extraction, transformation, validation, and ingestion into Redshift.
 - Performance optimizations, such as data partitioning and indexing strategies, will be explored for further improvements.
+
+## **Architecture Diagram**  
+![ETL Architecture](architecture_diagram.png)
